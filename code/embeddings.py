@@ -186,6 +186,7 @@ class Wikipedia2VecEmbedding(Embedding):
         return word
     
     def index(self, word):
+        # 'ENTITY/Rare_(company)' -> 'Rare (company)'
         prepr_word = self._preprocess_word(word)
 
         if (not self.dict_cache is None) and prepr_word in self.dict_cache:
