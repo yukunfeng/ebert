@@ -14,7 +14,6 @@ from embeddings import MappedEmbedding, load_embedding
 from mappers import load_mapper
 
 from kb.wiki_linking_util import WikiCandidateMentionGenerator
-from utils.util_wikidata import load_wikidata
 from tqdm import tqdm, trange
 from torch.autograd import Variable
 import re
@@ -185,7 +184,6 @@ class EntityLinkingAsLM:
 
         tmp_bert_model = BertModel.from_pretrained(bert_name)
         self.bert_emb = tmp_bert_model.embeddings.word_embeddings
-        self.bert_full_input_emb = tmp_bert_model.embeddings
         del tmp_bert_model
          
         self.model = EmbInputBertForMaskedEmbLM.from_pretrained(bert_name).to(device = self.device)
@@ -495,10 +493,10 @@ class EntityLinkingAsLM:
         with open(out_file, "w") as whandle:
             whandle.write("".join(norm_predictions))
         
-    def train(self, train_file, dev_file, test_file, model_dir, wikidata_path,
-            use_type_emb, print_loss_steps,
+    def train(self, train_file, dev_file, model_dir, test_file,
             batch_size = 128, eval_batch_size = 4, gradient_accumulation_steps = 16, verbose = True,
-            epochs = 15, warmup_proportion = 0.1, lr = 5e-5, do_reinit_lm = False, beta2 = 0.999):
+            epochs = 15, warmup_proportion = 0.1, lr = 5e-5, do_reinit_lm = False, beta2 = 0.999,
+            null_penalty=1.0):
         
         self.ent2idx = {None: 0}
         
@@ -506,34 +504,35 @@ class EntityLinkingAsLM:
             for module in self.model.cls.predictions.transform.modules():
                 self.model._init_weights(module)
         
-
         train_data = self.read_aida_file(train_file, ignore_gold = False)
         dev_data = self.read_aida_file(dev_file, ignore_gold = False)
-        test_data = self.read_aida_file(test_file, ignore_gold = False)
+        test_data = self.read_aida_file(test_file, ignore_gold = True)
         train_samples = self.data2samples(train_data)
+        null_count = 0
+        for sample in train_samples:
+            correct_idx = sample.correct_idx
+            if correct_idx == 0:
+                null_count += 1
+        null_ratio = null_count / len(train_samples)
+        print(f"null_count:{null_count}/{len(train_samples)}, ratio:{null_ratio:.2f}")
         dev_samples = self.data2samples(dev_data)
-        # Test is only used for collecting all entities (self.ent2idx)
-        # so that we can give a shape to ent embeddings
         test_samples = self.data2samples(test_data)
 
-        # null_vector is for None label
-        self.ent_emb = torch.nn.Embedding(len(self.ent2idx), self.null_vector.shape[0])
-        idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
-        if use_type_emb:
-            self.wiki_title2qid, self.qid2label, self.qid2parent_qids = load_wikidata(wikidata_path)
-            found_ent = 0
-            for idx in range(1, len(idx2ent)):
-                wiki_title = idx2ent[idx] # 'Rare_(company)'
-                emb = self.get_ent_emb_from_type_knowledge(wiki_title)
-                if emb is not None:
-                    self.ent_emb.weight.data[idx] = emb
-                    found_ent += 1
-            found_ratio = found_ent / (len(idx2ent) - 1)
-            print(f"found_ent: {found_ent}/{len(idx2ent) - 1} = {found_ratio:.2f}")
-        self.ent_emb = self.ent_emb.to(device=self.device)
+        entity_embedding = torch.FloatTensor(
+            len(self.ent2idx), self.null_vector.shape[0]).uniform_(
+                  -self.model.config.initializer_range,
+                  self.model.config.initializer_range)
+        #  idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
+        #  entity_embedding.weight.data[1:] = torch.tensor(self.ebert_emb[[self.ent_prefix + idx2ent[idx] for idx in range(1, len(idx2ent))]])
+        entity_embedding = entity_embedding.to(dtype=self.null_vector.dtype)
+        entity_embedding = entity_embedding.to(device=self.device)
+        entity_embedding.requires_grad = True
+        self.entity_embedding = entity_embedding
 
-        self.parameters = [self.null_vector, self.ent_emb.weight]
-        optimizer_grouped_parameters = [{'params': [self.null_vector, self.ent_emb.weight], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
+        self.parameters = [self.null_vector, self.entity_embedding]
+        optimizer_grouped_parameters = [{'params': [self.null_vector, self.entity_embedding], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
+        #  self.parameters = [self.null_vector]
+        #  optimizer_grouped_parameters = [{'params': [self.null_vector], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
         
         if self.do_use_priors:
             self.parameters.append(self.null_bias)
@@ -563,7 +562,8 @@ class EntityLinkingAsLM:
             train_loss = self.train_loop(train_samples,
                     batch_size = batch_size // gradient_accumulation_steps, 
                     gradient_accumulation_steps = gradient_accumulation_steps,
-                    print_loss_steps=print_loss_steps)
+                    null_penalty=null_penalty)
+            
             print(f"Finishied training epoch {_+1}, loss per sample: {train_loss}")
             prec, rec, f1 = self.eval_loop(dev_samples, batch_size = eval_batch_size)
             #  self.save(model_dir, epoch = _+1)
@@ -573,42 +573,15 @@ class EntityLinkingAsLM:
                 print("\nNew best micro F1 in epoch {}! P R F1: {:.4} {:.4} {:.4}".format(_+1, prec, rec, f1), flush = True)
                 print("(This is an estimate. Use predict functions and the scorer for the real result.)", flush = True)
                 self.save(model_dir, epoch = None)
-
-    def get_ent_emb_from_type_knowledge(self, wiki_title):
-      """"
-      wiki_title: str, e.g., Jimmy_Wales
-      return: tensor of shape (768,) if found else None
-      """
-      if (wiki_title in self.wiki_title2qid and
-          self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
-          qid = self.wiki_title2qid[wiki_title]
-          parent_qids = self.qid2parent_qids[qid]
-          valid_parent_count = 0
-          sum_label_emb = torch.zeros(size=(self.bert_emb.weight.shape[1],),
-                                      dtype=self.bert_emb.weight.dtype)
-          for qid in parent_qids:
-              if qid in self.qid2label:
-                  label = self.qid2label[qid]
-                  label_tokenized = self.tokenizer.tokenize(label)
-                  label_ids = self.tokenizer.convert_tokens_to_ids(label_tokenized)
-                  label_ids = torch.tensor(label_ids)
-                  label_emb = self.bert_emb(label_ids) # shape: (n, 768)
-                  label_emb = torch.mean(label_emb, dim=0) # shape: (768,)
-                  sum_label_emb = sum_label_emb + label_emb
-                  valid_parent_count += 1
-          if valid_parent_count > 0:
-              mean_label_emb = sum_label_emb / valid_parent_count
-              return mean_label_emb
-      return None
-
+    
     def save(self, model_dir, epoch=None):
         f_model = os.path.join(model_dir, "model.pth") if epoch is None else os.path.join(model_dir, f"model_{epoch}.pth")
         f_null_vector = os.path.join(model_dir, "null_vector.pth") if epoch is None else os.path.join(model_dir, f"null_vector_{epoch}.pth")
-        f_ent_emb = os.path.join(model_dir, "ent_emb.pth")
-        f_ent2idx = os.path.join(model_dir, "ent2idx.pth")
         torch.save(self.model.state_dict(), f_model)
         torch.save(self.null_vector, f_null_vector)
-        torch.save(self.ent_emb, f_ent_emb)
+        f_ent_emb = os.path.join(model_dir, "ent_emb.pth")
+        f_ent2idx = os.path.join(model_dir, "ent2idx.pth")
+        torch.save(self.entity_embedding, f_ent_emb)
         with open(f_ent2idx, 'wb') as fh:
             pickle.dump(self.ent2idx, fh)
         
@@ -623,7 +596,7 @@ class EntityLinkingAsLM:
         f_ent2idx = os.path.join(model_dir, "ent2idx.pth")
         self.model.load_state_dict(torch.load(f_model))
         self.null_vector.data = torch.load(f_null_vector).data
-        self.ent_emb = torch.load(f_ent_emb)
+        self.entity_embedding = torch.load(f_ent_emb)
         with open(f_ent2idx, 'rb') as fh:
             self.ent2idx = pickle.load(fh)
         
@@ -668,11 +641,10 @@ class EntityLinkingAsLM:
         return {"input_ids": input_embeddings, "attention_mask": attention_mask, "label_ids": label_ids}
 
     def train_loop(self, samples, batch_size, gradient_accumulation_steps,
-                   print_loss_steps, verbose = True):
+                   verbose = True, null_penalty=1.0):
         return self.loop(samples = samples, batch_size = batch_size, 
                 gradient_accumulation_steps = gradient_accumulation_steps, 
-                mode = "train", verbose = verbose,
-                print_loss_steps=print_loss_steps)
+                mode = "train", verbose = verbose, null_penalty=null_penalty)
 
     def eval_loop(self, samples, batch_size, verbose = True):
         return self.loop(samples = samples, batch_size = batch_size, 
@@ -683,7 +655,7 @@ class EntityLinkingAsLM:
                 gradient_accumulation_steps = 1, mode = "pred", verbose = verbose)
 
     def loop(self, samples, batch_size, mode, gradient_accumulation_steps,
-             verbose = 1, print_loss_steps=200):
+             verbose = 1, null_penalty=1.0):
         assert mode in ("train", "eval", "pred")
 
         all_true, all_pred, all_losses, all_pred_spans = [], [], [], []
@@ -695,7 +667,7 @@ class EntityLinkingAsLM:
 
         idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
         assert len(idx2ent) == len(self.ent2idx)
-        #  assert sorted(list(idx2ent.keys())) == list(range(len(idx2ent)))
+        assert sorted(list(idx2ent.keys())) == list(range(len(idx2ent)))
     
         #  entity_embedding = torch.zeros((len(idx2ent), self.null_vector.shape[0]))
         #  entity_embedding[1:] = torch.tensor(self.ebert_emb[[self.ent_prefix + idx2ent[idx] for idx in range(1, len(idx2ent))]])
@@ -718,7 +690,8 @@ class EntityLinkingAsLM:
             all_outputs = self.model(**input_dict)[0]
             outputs = torch.stack([all_outputs[j, position] for j, position in enumerate(mask_positions)])
 
-            batch_entity_embedding = self.ent_emb(torch.tensor(all_entities).to(device=self.device)).to(device=self.device) # move entity embeddings for entire batch to GPU
+            #  batch_entity_embedding = self.entity_embedding[torch.tensor(all_entities)].to(device = self.device) # move entity embeddings for entire batch to GPU
+            batch_entity_embedding = self.entity_embedding[torch.tensor(all_entities).to(device=self.device)].to(device = self.device) # move entity embeddings for entire batch to GPU
 
             batch_loss = 0
             for j, sample in enumerate(batch):
@@ -748,14 +721,14 @@ class EntityLinkingAsLM:
 
                 elif mode == "train":
                     sample_loss = -torch.log(probas[label_ids[j]])
-                    
+                    if label_ids[j] == 0:
+                      sample_loss = sample_loss * null_penalty
                     batch_loss += sample_loss / len(batch)
                     all_losses.append(float(sample_loss.item()))
 
             if mode == "train":
-                if (step+1) % print_loss_steps == 0:
+                if (step+1) % 1000 == 0:
                     print(f"step {step+1}: mean loss over batch: {batch_loss.item()}")
-
                 batch_loss.backward()
                 
                 if (step+1) % gradient_accumulation_steps == 0:
@@ -783,11 +756,6 @@ def parse_args():
     parser.add_argument("--dev_file", type = str, default = "../data/AIDA/aida_dev.txt")
     parser.add_argument("--test_file", type = str, default = "../data/AIDA/aida_test.txt")
 
-    parser.add_argument("--wikidata_path", type = str, default = "/home/lr/yukun/kg-bert/entities.slimed.tsv")
-
-    parser.add_argument("--use_type_emb", dest = "use_type_emb", action = "store_true", default = True)
-    parser.add_argument("--nouse_type_emb", dest = "use_type_emb", action = "store_false")
-
     parser.add_argument("--do_reinit_lm", action = "store_true")
     parser.add_argument("--do_predict_all_epochs", action = "store_true")
     
@@ -807,12 +775,12 @@ def parse_args():
     parser.add_argument("--max_candidates", type = int, default = 1000)
     parser.add_argument("--epochs", type = int, default = 10)
     parser.add_argument("--warmup_proportion", type = float, default = 0.1)
+    parser.add_argument("--null_penalty", type = float, default = 1.0)
     parser.add_argument("--device", type = int, default = 0)
     parser.add_argument("--lr", type = float, default = 2e-5)
     parser.add_argument("--batch_size", type = int, default = 128)
     parser.add_argument("--eval_batch_size", type = int, default = 4)
     parser.add_argument("--gradient_accumulation_steps", type = int, default = 16)
-    parser.add_argument("--print_loss_steps", type = int, default = 200)
     parser.add_argument("--granularity", type = str, default = "document", choices = ("document", "paragraph"))
 
     return parser.parse_args()
@@ -832,12 +800,9 @@ def train(args):
             "test_file": args.test_file,
             "model_dir": args.model_dir, "lr": args.lr, "epochs": args.epochs,
             "do_reinit_lm": args.do_reinit_lm,
+            "null_penalty": args.null_penalty,
             "batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "print_loss_steps": args.print_loss_steps,
-            "warmup_proportion": args.warmup_proportion, "eval_batch_size": args.eval_batch_size,
-            "wikidata_path": args.wikidata_path,
-            "use_type_emb": args.use_type_emb,
-            }
+            "warmup_proportion": args.warmup_proportion, "eval_batch_size": args.eval_batch_size}
 
     with open(os.path.join(args.model_dir, "model_args.json"), "w") as handle:
             json.dump(model_args, handle)
@@ -846,6 +811,7 @@ def train(args):
 
     print(model_args, flush = True)
     print(train_args, flush = True)
+
     model = EntityLinkingAsLM(**model_args, device = args.device)
     model.train(**train_args)
     

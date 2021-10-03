@@ -10,6 +10,63 @@ SPARQL_API = "https://query.wikidata.org/sparql"
 WIKIDATA_RGX = re.compile("\AQ[0-9]+\Z")
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 
+def load_wikidata(prep_input_path: str):
+  """Parses the preprocessed wikdata file into Python dicts.
+
+  Args:
+    prep_input_path: path to the preprocessed wikidata file
+
+  Returns:
+    wiki_title2id: dict, key is wiki_title and value is kg info.
+      Currently not used for memory efficiency
+    wiki_title2id: dict, key is wiki_title.lower and value is kg info.
+      Uncased version is for second matching.
+    entity_id2label: dict, key is entity_id and value is word form
+  """
+  wiki_title2id = {}
+  # used for converting parent_id to word form if necessary.
+  entity_id2label = {}
+  entity_id2parents = {}
+  
+  with open(prep_input_path, "r") as fh:
+    for idx, line in enumerate(fh):
+      line = line.strip()
+      # Skip empty lines
+      if not line:
+        continue
+      items = line.split("\t")
+
+      wiki_title = items[2]
+      entity_id = items[0]
+      # Dirty cases:  a few entity ids doesn't start with 'Q' and are discarded
+      if entity_id[0] != "Q":
+        continue
+
+      # E.g., Q100->100 for converting into integers.
+      # Converting into integers helps save much memory
+      #  entity_id = int(entity_id[1:])
+      # entity_label. E.g., George Washington is a label of entity Q23.
+      entity_label = items[1]
+      # Converting into integers like above
+
+      parent_ids = items[3]
+      # NONE if no parent_id
+      if parent_ids != "NONE":
+        parent_ids = parent_ids.split()
+        #  parent_ids = [int(parent_id[1:]) for parent_id in parent_ids]
+        parent_ids = tuple(parent_ids)
+        entity_id2parents[entity_id] = parent_ids
+
+      # hard code here: filtering
+      if not (entity_label.find("Wikimedia project page") >= 0 or
+              entity_label.find("metaclass") >= 0 or
+              entity_label.find("Wikimedia list article") >= 0 or
+              entity_label.find("Wikimedia disambiguation page") >= 0):
+          entity_id2label[entity_id] = entity_label
+
+      wiki_title2id[wiki_title.strip().replace(' ', '_')] = entity_id
+  return wiki_title2id, entity_id2label, entity_id2parents
+
 
 def wikidata_url2id(wikidata_url):
     wikidata_id = wikidata_url.split("/")[-1]
