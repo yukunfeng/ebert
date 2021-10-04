@@ -495,13 +495,69 @@ class EntityLinkingAsLM:
         
         with open(out_file, "w") as whandle:
             whandle.write("".join(norm_predictions))
+
+
+    def extract_spans(self, in_file, out_file):
+        """
+        Extract gold spans from AIDA file into a more handy format.
         
+        in_file : File in standard AIDA format
+        out_file : TSV with format start -- end -- entity (wiki) id -- surface form
+
+        (Note that start and end positions are calculated w.r.t. to the entire file.)
+        """
+        counter = 0
+        flag = False
+        spans = []
+        with open(in_file) as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith("DOCSTART") or line.startswith("DOCEND") or line == "*NL*" or len(line) == 0:
+                    continue
+                elif line.startswith("MMSTART"):
+                    assert not flag
+                    entity = line.strip().split()[-1]
+
+                    entity = normalize_entity(self.ebert_emb, entity, self.ent_prefix)
+
+                    spans.append([entity, [], counter, counter-1])
+                    flag = True
+                elif line.startswith("MMEND"):
+                    flag = False
+                elif flag:
+                    spans[-1][-1] += 1
+                    spans[-1][1].append(line)
+                    counter += 1
+                else:
+                    counter += 1
+
+        spans.sort(key = lambda x:(x[-2], x[-1]))
+
+        with open(out_file, "w") as whandle:
+            for entity, surface, start, end in spans:
+                surface = " ".join(surface)
+                whandle.write(f"{start}\t{end}\t{entity}\t{surface}\n")
+
+
     def train(self, train_file, dev_file, model_dir, test_file,
             wikidata_path, use_type_emb,
             batch_size = 128, eval_batch_size = 4, gradient_accumulation_steps = 16, verbose = True,
             epochs = 15, warmup_proportion = 0.1, lr = 5e-5, do_reinit_lm = False, beta2 = 0.999,
             null_penalty=1.0):
-        
+
+        self.model_dir = model_dir
+        self.dev_file = dev_file
+        self.test_file = test_file
+
+        # Create temp gold files for predicting later
+        self.dev_gold_file = os.path.join(model_dir,
+                             os.path.basename(self.dev_file) + ".gold.txt")
+        self.test_gold_file = os.path.join(model_dir,
+                              os.path.basename(self.test_file) + ".gold.txt")
+        self.extract_spans(dev_file, self.dev_gold_file)
+        self.extract_spans(test_file, self.test_gold_file)
+
+
         self.ent2idx = {None: 0}
         
         if do_reinit_lm:
@@ -551,7 +607,6 @@ class EntityLinkingAsLM:
         self.entity_embedding.requires_grad = True
         assert self.entity_embedding.requires_grad == True
         assert self.entity_embedding.is_leaf == True
-        exit(0)
 
 
         self.parameters = [self.null_vector, self.entity_embedding]
@@ -592,12 +647,40 @@ class EntityLinkingAsLM:
             print(f"Finishied training epoch {_+1}, loss per sample: {train_loss}")
             prec, rec, f1 = self.eval_loop(dev_samples, batch_size = eval_batch_size)
             #  self.save(model_dir, epoch = _+1)
-
+            print(f"prec:{prec}, rec:{rec}, f1:{f1} in epoch {_+1}")
             if f1 > best_f1: 
                 best_f1 = f1
-                print("\nNew best micro F1 in epoch {}! P R F1: {:.4} {:.4} {:.4}".format(_+1, prec, rec, f1), flush = True)
-                print("(This is an estimate. Use predict functions and the scorer for the real result.)", flush = True)
-                self.save(model_dir, epoch = None)
+                print(f"This is a new best micro f1 in epoch {_+1}")
+                #  print("\nNew best micro F1 in epoch {}! P R F1: {:.4} {:.4} {:.4}".format(_+1, prec, rec, f1), flush = True)
+                #  print("(This is an estimate. Use predict functions and the scorer for the real result.)", flush = True)
+                #  self.save(model_dir, epoch = None)
+            self.get_predict_score()
+
+
+    def get_predict_score(self):
+        from score_aida import load_file
+        from score_aida import score_micro_f1, score_macro_f1
+
+        out_file_test = f"{os.path.basename(self.test_file)}.pred.txt"
+        test_pred_file = os.path.join(self.model_dir, out_file_test)
+        self.predict_aida(in_file = args.test_file, out_file = test_pred_file,
+                batch_size = 4, iterations = 1)
+        true = load_file(self.test_gold_file)
+        pred = load_file(test_pred_file)
+        print("Test Micro P: {:.5} R: {:.5} F1: {:.5}".format(*score_micro_f1(true, pred)))
+        print("Test Macro P: {:.5} R: {:.5} F1: {:.5}".format(*score_macro_f1(true, pred)))
+
+        out_file_dev = f"{os.path.basename(self.dev_file)}.pred.txt"
+        dev_pred_file = os.path.join(self.model_dir, out_file_dev)
+        self.predict_aida(in_file = args.dev_file, out_file = dev_pred_file,
+                batch_size = 4, iterations = 1)
+
+        true = load_file(self.dev_gold_file)
+        pred = load_file(dev_pred_file)
+        print("Valid Micro P: {:.5} R: {:.5} F1: {:.5}".format(*score_micro_f1(true, pred)))
+        print("Valid Macro P: {:.5} R: {:.5} F1: {:.5}".format(*score_macro_f1(true, pred)))
+
+
 
     def get_ent_emb_from_type_knowledge(self, wiki_title):
       """"
@@ -779,7 +862,7 @@ class EntityLinkingAsLM:
                     all_losses.append(float(sample_loss.item()))
 
             if mode == "train":
-                if (step+1) % 1 == 0:
+                if (step+1) % 1000 == 0:
                     print(f"step {step+1}: mean loss over batch: {batch_loss.item()}")
                 batch_loss.backward()
                 
