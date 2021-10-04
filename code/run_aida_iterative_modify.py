@@ -14,6 +14,7 @@ from embeddings import MappedEmbedding, load_embedding
 from mappers import load_mapper
 
 from kb.wiki_linking_util import WikiCandidateMentionGenerator
+from utils.util_wikidata import load_wikidata
 from tqdm import tqdm, trange
 from torch.autograd import Variable
 import re
@@ -22,13 +23,15 @@ import json
 import copy
 
 def normalize_entity(ebert_emb, entity, prefix = ""):
+    entity_no_prefix = entity
     entity = prefix + entity
 
     if entity is None:
         return None
 
     if not entity in ebert_emb:
-        return None
+        return entity_no_prefix
+        #  return None
 
     true_title = ebert_emb.index(entity).title
     true_entity = "_".join(ebert_emb.index(entity).title.split())
@@ -494,6 +497,7 @@ class EntityLinkingAsLM:
             whandle.write("".join(norm_predictions))
         
     def train(self, train_file, dev_file, model_dir, test_file,
+            wikidata_path, use_type_emb,
             batch_size = 128, eval_batch_size = 4, gradient_accumulation_steps = 16, verbose = True,
             epochs = 15, warmup_proportion = 0.1, lr = 5e-5, do_reinit_lm = False, beta2 = 0.999,
             null_penalty=1.0):
@@ -508,6 +512,8 @@ class EntityLinkingAsLM:
         dev_data = self.read_aida_file(dev_file, ignore_gold = False)
         test_data = self.read_aida_file(test_file, ignore_gold = True)
         train_samples = self.data2samples(train_data)
+
+        # Count ratio of null label
         null_count = 0
         for sample in train_samples:
             correct_idx = sample.correct_idx
@@ -515,9 +521,11 @@ class EntityLinkingAsLM:
                 null_count += 1
         null_ratio = null_count / len(train_samples)
         print(f"null_count:{null_count}/{len(train_samples)}, ratio:{null_ratio:.2f}")
+
         dev_samples = self.data2samples(dev_data)
         test_samples = self.data2samples(test_data)
 
+        # Init entity embeddings
         entity_embedding = torch.FloatTensor(
             len(self.ent2idx), self.null_vector.shape[0]).uniform_(
                   -self.model.config.initializer_range,
@@ -526,8 +534,25 @@ class EntityLinkingAsLM:
         #  entity_embedding.weight.data[1:] = torch.tensor(self.ebert_emb[[self.ent_prefix + idx2ent[idx] for idx in range(1, len(idx2ent))]])
         entity_embedding = entity_embedding.to(dtype=self.null_vector.dtype)
         entity_embedding = entity_embedding.to(device=self.device)
-        entity_embedding.requires_grad = True
         self.entity_embedding = entity_embedding
+
+        if use_type_emb:
+            idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
+            self.wiki_title2qid, self.qid2label, self.qid2parent_qids = load_wikidata(wikidata_path)
+            found_ent = 0
+            for idx in range(1, len(idx2ent)):
+                wiki_title = idx2ent[idx] # 'Rare_(company)'
+                emb = self.get_ent_emb_from_type_knowledge(wiki_title)
+                if emb is not None:
+                    self.entity_embedding.data[idx] = emb.detach()
+                    found_ent += 1
+            found_ratio = found_ent / (len(idx2ent) - 1)
+            print(f"found_ent: {found_ent}/{len(idx2ent) - 1} = {found_ratio:.2f}")
+        self.entity_embedding.requires_grad = True
+        assert self.entity_embedding.requires_grad == True
+        assert self.entity_embedding.is_leaf == True
+        exit(0)
+
 
         self.parameters = [self.null_vector, self.entity_embedding]
         optimizer_grouped_parameters = [{'params': [self.null_vector, self.entity_embedding], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
@@ -573,6 +598,33 @@ class EntityLinkingAsLM:
                 print("\nNew best micro F1 in epoch {}! P R F1: {:.4} {:.4} {:.4}".format(_+1, prec, rec, f1), flush = True)
                 print("(This is an estimate. Use predict functions and the scorer for the real result.)", flush = True)
                 self.save(model_dir, epoch = None)
+
+    def get_ent_emb_from_type_knowledge(self, wiki_title):
+      """"
+      wiki_title: str, e.g., Jimmy_Wales
+      return: tensor of shape (768,) if found else None
+      """
+      if (wiki_title in self.wiki_title2qid and
+          self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
+          qid = self.wiki_title2qid[wiki_title]
+          parent_qids = self.qid2parent_qids[qid]
+          valid_parent_count = 0
+          sum_label_emb = torch.zeros(size=(self.bert_emb.weight.shape[1],),
+                                      dtype=self.bert_emb.weight.dtype)
+          for qid in parent_qids:
+              if qid in self.qid2label:
+                  label = self.qid2label[qid]
+                  label_tokenized = self.tokenizer.tokenize(label)
+                  label_ids = self.tokenizer.convert_tokens_to_ids(label_tokenized)
+                  label_ids = torch.tensor(label_ids)
+                  label_emb = self.bert_emb(label_ids) # shape: (n, 768)
+                  label_emb = torch.mean(label_emb, dim=0) # shape: (768,)
+                  sum_label_emb = sum_label_emb + label_emb
+                  valid_parent_count += 1
+          if valid_parent_count > 0:
+              mean_label_emb = sum_label_emb / valid_parent_count
+              return mean_label_emb
+      return None
     
     def save(self, model_dir, epoch=None):
         f_model = os.path.join(model_dir, "model.pth") if epoch is None else os.path.join(model_dir, f"model_{epoch}.pth")
@@ -727,7 +779,7 @@ class EntityLinkingAsLM:
                     all_losses.append(float(sample_loss.item()))
 
             if mode == "train":
-                if (step+1) % 1000 == 0:
+                if (step+1) % 1 == 0:
                     print(f"step {step+1}: mean loss over batch: {batch_loss.item()}")
                 batch_loss.backward()
                 
@@ -755,6 +807,11 @@ def parse_args():
     parser.add_argument("--train_file", type = str, default = "../data/AIDA/aida_train.txt")
     parser.add_argument("--dev_file", type = str, default = "../data/AIDA/aida_dev.txt")
     parser.add_argument("--test_file", type = str, default = "../data/AIDA/aida_test.txt")
+
+    parser.add_argument("--wikidata_path", type = str, default = "/home/lr/yukun/kg-bert/entities.slimed.tsv")
+
+    parser.add_argument("--use_type_emb", dest = "use_type_emb", action = "store_true", default = True)
+    parser.add_argument("--nouse_type_emb", dest = "use_type_emb", action = "store_false")
 
     parser.add_argument("--do_reinit_lm", action = "store_true")
     parser.add_argument("--do_predict_all_epochs", action = "store_true")
@@ -801,6 +858,8 @@ def train(args):
             "model_dir": args.model_dir, "lr": args.lr, "epochs": args.epochs,
             "do_reinit_lm": args.do_reinit_lm,
             "null_penalty": args.null_penalty,
+            "wikidata_path": args.wikidata_path,
+            "use_type_emb": args.use_type_emb,
             "batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "warmup_proportion": args.warmup_proportion, "eval_batch_size": args.eval_batch_size}
 
