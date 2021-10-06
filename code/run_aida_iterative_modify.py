@@ -187,6 +187,7 @@ class EntityLinkingAsLM:
 
         tmp_bert_model = BertModel.from_pretrained(bert_name)
         self.bert_emb = tmp_bert_model.embeddings.word_embeddings
+        self.bert_pos_emb = tmp_bert_model.embeddings
         del tmp_bert_model
          
         self.model = EmbInputBertForMaskedEmbLM.from_pretrained(bert_name).to(device = self.device)
@@ -540,11 +541,13 @@ class EntityLinkingAsLM:
 
 
     def train(self, train_file, dev_file, model_dir, test_file,
-            wikidata_path, use_type_emb,
+            wikidata_path, use_type_emb, use_pos_emb, type_emb_option,
             batch_size = 128, eval_batch_size = 4, gradient_accumulation_steps = 16, verbose = True,
             epochs = 15, warmup_proportion = 0.1, lr = 5e-5, do_reinit_lm = False, beta2 = 0.999,
             null_penalty=1.0):
 
+        self.type_emb_option = type_emb_option
+        self.use_pos_emb = use_pos_emb
         self.model_dir = model_dir
         self.dev_file = dev_file
         self.test_file = test_file
@@ -687,28 +690,57 @@ class EntityLinkingAsLM:
       wiki_title: str, e.g., Jimmy_Wales
       return: tensor of shape (768,) if found else None
       """
-      if (wiki_title in self.wiki_title2qid and
-          self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
-          qid = self.wiki_title2qid[wiki_title]
-          parent_qids = self.qid2parent_qids[qid]
-          valid_parent_count = 0
-          sum_label_emb = torch.zeros(size=(self.bert_emb.weight.shape[1],),
-                                      dtype=self.bert_emb.weight.dtype)
-          for qid in parent_qids:
-              if qid in self.qid2label:
-                  label = self.qid2label[qid]
-                  label_tokenized = self.tokenizer.tokenize(label)
-                  label_ids = self.tokenizer.convert_tokens_to_ids(label_tokenized)
-                  label_ids = torch.tensor(label_ids)
-                  label_emb = self.bert_emb(label_ids) # shape: (n, 768)
-                  label_emb = torch.mean(label_emb, dim=0) # shape: (768,)
-                  sum_label_emb = sum_label_emb + label_emb
-                  valid_parent_count += 1
-          if valid_parent_count > 0:
-              mean_label_emb = sum_label_emb / valid_parent_count
-              return mean_label_emb
-      return None
-    
+      assert self.type_emb_option in ['type', 'surface', 'mix']
+
+      type_emb = None
+      if self.type_emb_option in ['type', 'mix']:
+        if (wiki_title in self.wiki_title2qid and
+            self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
+            qid = self.wiki_title2qid[wiki_title]
+            parent_qids = self.qid2parent_qids[qid]
+            valid_parent_count = 0
+            sum_label_emb = torch.zeros(size=(self.bert_emb.weight.shape[1],),
+                                        dtype=self.bert_emb.weight.dtype)
+            for qid in parent_qids:
+                if qid in self.qid2label:
+                    label = self.qid2label[qid]
+                    label_tokenized = self.tokenizer.tokenize(label)
+                    label_ids = self.tokenizer.convert_tokens_to_ids(label_tokenized)
+                    label_ids = torch.tensor(label_ids)
+                    label_emb = self.bert_emb(label_ids) # shape: (n, 768)
+                    label_emb = torch.mean(label_emb, dim=0) # shape: (768,)
+                    sum_label_emb = sum_label_emb + label_emb
+                    valid_parent_count += 1
+            if valid_parent_count > 0:
+                mean_label_emb = sum_label_emb / valid_parent_count
+                type_emb = mean_label_emb
+
+      surface_emb = None
+      if self.type_emb_option in ['surface', 'mix']:
+          wiki_title = wiki_title.replace('_', ' ')
+          wiki_title = wiki_title.replace('(', '')
+          wiki_title = wiki_title.replace(')', '')
+          if wiki_title == '':
+              return None
+          wiki_title_tokenized = self.tokenizer.tokenize(wiki_title)
+          wiki_title_ids = self.tokenizer.convert_tokens_to_ids(wiki_title_tokenized)
+          wiki_title_ids = torch.tensor(wiki_title_ids)
+          wiki_title_emb = self.bert_emb(wiki_title_ids) # shape: (n, 768)
+          surface_emb = torch.mean(wiki_title_emb, dim=0) # shape: (768,)
+
+      if self.type_emb_option == "type":
+          return type_emb
+      elif self.type_emb_option == "surface":
+          return surface_emb
+      elif self.type_emb_option == "mix":
+          import ipdb; ipdb.set_trace()
+          if type_emb is None and surface_emb is not None:
+              return surface_emb
+          if surface_emb is None and type_emb is not None:
+              return type_emb
+          return (type_emb + surface_emb) / 2
+
+
     def save(self, model_dir, epoch=None):
         f_model = os.path.join(model_dir, "model.pth") if epoch is None else os.path.join(model_dir, f"model_{epoch}.pth")
         f_null_vector = os.path.join(model_dir, "null_vector.pth") if epoch is None else os.path.join(model_dir, f"null_vector_{epoch}.pth")
@@ -754,7 +786,10 @@ class EntityLinkingAsLM:
             input_ids[i,:len(sample.input_ids)] = torch.tensor(sample.input_ids).to(dtype = input_ids.dtype)
             attention_mask[i,:len(sample.input_ids)] = 1
 
-        input_embeddings = self.bert_emb(input_ids)
+        if self.use_pos_emb:
+            input_embeddings = self.bert_pos_emb(input_ids)
+        else:
+            input_embeddings = self.bert_emb(input_ids)
         #unk_id = self.tokenizer.vocab["[UNK]"]
 
         for i, sample in enumerate(samples):
@@ -894,7 +929,12 @@ def parse_args():
     parser.add_argument("--wikidata_path", type = str, default = "/home/lr/yukun/kg-bert/entities.slimed.tsv")
 
     parser.add_argument("--use_type_emb", dest = "use_type_emb", action = "store_true", default = True)
+    parser.add_argument("--type_emb_option", type = str, default = "type",
+                        help="type, surface or mix")
     parser.add_argument("--nouse_type_emb", dest = "use_type_emb", action = "store_false")
+
+    parser.add_argument("--use_pos_emb", dest = "use_pos_emb", action = "store_true", default = True)
+    parser.add_argument("--nouse_pos_emb", dest = "use_pos_emb", action = "store_false")
 
     parser.add_argument("--do_reinit_lm", action = "store_true")
     parser.add_argument("--do_predict_all_epochs", action = "store_true")
@@ -941,7 +981,9 @@ def train(args):
             "model_dir": args.model_dir, "lr": args.lr, "epochs": args.epochs,
             "do_reinit_lm": args.do_reinit_lm,
             "null_penalty": args.null_penalty,
+            "type_emb_option": args.type_emb_option,
             "wikidata_path": args.wikidata_path,
+            "use_pos_emb": args.use_pos_emb,
             "use_type_emb": args.use_type_emb,
             "batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "warmup_proportion": args.warmup_proportion, "eval_batch_size": args.eval_batch_size}
