@@ -35,7 +35,7 @@ def normalize_entity(ebert_emb, entity, prefix = ""):
 
     true_title = ebert_emb.index(entity).title
     true_entity = "_".join(ebert_emb.index(entity).title.split())
-    
+
     assert prefix + true_entity in ebert_emb
     return true_entity
 
@@ -43,7 +43,7 @@ def normalize_entity(ebert_emb, entity, prefix = ""):
 def extract_spans(in_file, out_file, kb = None):
     """
     Extract gold spans from AIDA file into a more handy format.
-    
+
     in_file : File in standard AIDA format
     out_file : TSV with format start -- end -- entity (wiki) id -- surface form
 
@@ -65,8 +65,8 @@ def extract_spans(in_file, out_file, kb = None):
                 entity = line.strip().split()[-1]
 
                 if kb is not None:
-                    entity = normalize_entity(kb, entity, kb.prefix) 
-                
+                    entity = normalize_entity(kb, entity, kb.prefix)
+
                 spans.append([entity, [], counter, counter-1])
                 flag = True
             elif line.startswith("MMEND"):
@@ -186,8 +186,9 @@ class EntityLinkingAsLM:
             self.ebert_emb = MappedEmbedding(self.ebert_emb, load_mapper(f"{ebert_name}.{bert_name}.{mapper_name}.npy"))
 
         tmp_bert_model = BertModel.from_pretrained(bert_name)
-        self.bert_emb = tmp_bert_model.embeddings.word_embeddings
-        self.bert_pos_emb = tmp_bert_model.embeddings
+        self.bert_pos_emb = tmp_bert_model.embeddings.to(device=self.device)
+        self.bert_emb = self.bert_pos_emb.word_embeddings
+        #  self.bert_emb = tmp_bert_model.embeddings.word_embeddings
         del tmp_bert_model
          
         self.model = EmbInputBertForMaskedEmbLM.from_pretrained(bert_name).to(device = self.device)
@@ -553,6 +554,12 @@ class EntityLinkingAsLM:
         self.dev_file = dev_file
         self.test_file = test_file
 
+        if use_type_emb and type_emb_option == 'mix':
+            self.gate_hidden = nn.Linear(self.null_vector.shape[0],
+                                         self.null_vector.shape[0])
+            self.gate_hidden.to(device=self.device)
+
+
         # Create temp gold files for predicting later
         self.dev_gold_file = os.path.join(model_dir,
                              os.path.basename(self.dev_file) + ".gold.txt")
@@ -583,20 +590,7 @@ class EntityLinkingAsLM:
         print(f"null_count:{null_count}/{len(train_samples)}, ratio:{null_ratio:.2f}")
 
         dev_samples = self.data2samples(dev_data)
-        test_samples = self.data2samples(test_data)
-
-        # Init entity embeddings
-        entity_embedding = torch.FloatTensor(
-            len(self.ent2idx), self.null_vector.shape[0]).uniform_(
-                  -self.model.config.initializer_range,
-                  self.model.config.initializer_range)
-        if self.use_ebert_emb:
-            print("using ebert_emb")
-            idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
-            entity_embedding.data[1:] = torch.tensor(self.ebert_emb[[self.ent_prefix + idx2ent[idx] for idx in range(1, len(idx2ent))]])
-        entity_embedding = entity_embedding.to(dtype=self.null_vector.dtype)
-        entity_embedding = entity_embedding.to(device=self.device)
-        self.entity_embedding = entity_embedding
+        #  test_samples = self.data2samples(test_data)
 
         if use_type_emb and not self.use_ebert_emb:
             print(f"using type emb, {self.type_emb_option}")
@@ -607,19 +601,12 @@ class EntityLinkingAsLM:
                 wiki_title = idx2ent[idx] # 'Rare_(company)'
                 emb = self.get_ent_emb_from_type_knowledge(wiki_title)
                 if emb is not None:
-                    self.entity_embedding.data[idx] = emb.detach()
                     found_ent += 1
             found_ratio = found_ent / (len(idx2ent) - 1)
             print(f"found_ent: {found_ent}/{len(idx2ent) - 1} = {found_ratio:.2f}")
-        self.entity_embedding.requires_grad = True
-        assert self.entity_embedding.requires_grad == True
-        assert self.entity_embedding.is_leaf == True
 
-
-        self.parameters = [self.null_vector, self.entity_embedding]
-        optimizer_grouped_parameters = [{'params': [self.null_vector, self.entity_embedding], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
-        #  self.parameters = [self.null_vector]
-        #  optimizer_grouped_parameters = [{'params': [self.null_vector], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
+        self.parameters = [self.null_vector]
+        optimizer_grouped_parameters = [{'params': [self.null_vector], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
         
         if self.do_use_priors:
             self.parameters.append(self.null_bias)
@@ -689,6 +676,22 @@ class EntityLinkingAsLM:
 
 
 
+    def get_ent_surface_emb(self, wiki_title):
+      surface_emb = None
+      wiki_title = wiki_title.replace('_', ' ')
+      wiki_title = wiki_title.replace('(', '')
+      wiki_title = wiki_title.replace(')', '')
+      if wiki_title == '':
+          return None
+      wiki_title_tokenized = self.tokenizer.tokenize(wiki_title)
+      wiki_title_ids = self.tokenizer.convert_tokens_to_ids(wiki_title_tokenized)
+      wiki_title_ids = torch.tensor(wiki_title_ids)
+      wiki_title_ids = wiki_title_ids.to(device=self.device)
+      wiki_title_emb = self.bert_emb(wiki_title_ids) # shape: (n, 768)
+      surface_emb = torch.mean(wiki_title_emb, dim=0) # shape: (768,)
+      return surface_emb
+
+
     def get_ent_emb_from_type_knowledge(self, wiki_title):
       """"
       wiki_title: str, e.g., Jimmy_Wales
@@ -705,12 +708,13 @@ class EntityLinkingAsLM:
             valid_parent_count = 0
             sum_label_emb = torch.zeros(size=(self.bert_emb.weight.shape[1],),
                                         dtype=self.bert_emb.weight.dtype)
+            sum_label_emb = sum_label_emb.to(device=self.device)
             for qid in parent_qids:
                 if qid in self.qid2label:
                     label = self.qid2label[qid]
                     label_tokenized = self.tokenizer.tokenize(label)
                     label_ids = self.tokenizer.convert_tokens_to_ids(label_tokenized)
-                    label_ids = torch.tensor(label_ids)
+                    label_ids = torch.tensor(label_ids).to(device=self.device)
                     label_emb = self.bert_emb(label_ids) # shape: (n, 768)
                     label_emb = torch.mean(label_emb, dim=0) # shape: (768,)
                     sum_label_emb = sum_label_emb + label_emb
@@ -718,33 +722,10 @@ class EntityLinkingAsLM:
             if valid_parent_count > 0:
                 mean_label_emb = sum_label_emb / valid_parent_count
                 type_emb = mean_label_emb
-
-      surface_emb = None
-      if self.type_emb_option in ['surface', 'mix']:
-          wiki_title = wiki_title.replace('_', ' ')
-          wiki_title = wiki_title.replace('(', '')
-          wiki_title = wiki_title.replace(')', '')
-          if wiki_title == '':
-              return None
-          wiki_title_tokenized = self.tokenizer.tokenize(wiki_title)
-          wiki_title_ids = self.tokenizer.convert_tokens_to_ids(wiki_title_tokenized)
-          wiki_title_ids = torch.tensor(wiki_title_ids)
-          wiki_title_emb = self.bert_emb(wiki_title_ids) # shape: (n, 768)
-          surface_emb = torch.mean(wiki_title_emb, dim=0) # shape: (768,)
-
-      if self.type_emb_option == "type":
+      if type_emb is None:
+          return self.get_ent_surface_emb(wiki_title)
+      else:
           return type_emb
-      elif self.type_emb_option == "surface":
-          return surface_emb
-      elif self.type_emb_option == "mix":
-          if type_emb is None and surface_emb is not None:
-              return surface_emb
-          if surface_emb is None and type_emb is not None:
-              return type_emb
-
-          #  return 0.3 * type_emb + 0.7 * surface_emb
-          return 0.7 * type_emb + 0.3 * surface_emb
-          #  return (type_emb + surface_emb) / 2
 
 
     def save(self, model_dir, epoch=None):
@@ -784,7 +765,9 @@ class EntityLinkingAsLM:
             max_len = self.max_len
         
         input_ids = torch.zeros((len(samples), max_len)).to(dtype = torch.long)
+        input_ids = input_ids.to(device=self.device)
         attention_mask = torch.zeros_like(input_ids)
+        attention_mask = attention_mask.to(device=self.device)
 
         for i, sample in enumerate(samples):
             assert len(sample.tokenized) <= max_len
@@ -866,8 +849,17 @@ class EntityLinkingAsLM:
             all_outputs = self.model(**input_dict)[0]
             outputs = torch.stack([all_outputs[j, position] for j, position in enumerate(mask_positions)])
 
-            #  batch_entity_embedding = self.entity_embedding[torch.tensor(all_entities)].to(device = self.device) # move entity embeddings for entire batch to GPU
-            batch_entity_embedding = self.entity_embedding[torch.tensor(all_entities).to(device=self.device)].to(device = self.device) # move entity embeddings for entire batch to GPU
+            #  batch_entity_embedding = self.entity_embedding[torch.tensor(all_entities).to(device=self.device)].to(device = self.device) # move entity embeddings for entire batch to GPU
+
+            wiki_titles = [idx2ent[idx] for idx in all_entities]
+            type_embs = [self.get_ent_emb_from_type_knowledge(wiki_title) for wiki_title in wiki_titles]
+            batch_type_embedding = torch.stack(type_embs).to(device=self.device)
+
+            wiki_title_surface_embs = [self.get_ent_surface_emb(wiki_title) for wiki_title in wiki_titles]
+            batch_surface_embedding = torch.stack(wiki_title_surface_embs).to(device=self.device)
+
+            gate_out = torch.sigmoid(self.gate_hidden(batch_type_embedding))
+            batch_entity_embedding = (1 - gate_out) * batch_type_embedding  + gate_out * batch_surface_embedding
 
             batch_loss = 0
             for j, sample in enumerate(batch):
