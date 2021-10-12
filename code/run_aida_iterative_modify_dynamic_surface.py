@@ -362,7 +362,7 @@ class EntityLinkingAsLM:
                 sample_tokenized = ["[CLS]"] + sample_tokenized + ["[SEP]"]
                 input_ids = self.tokenizer.convert_tokens_to_ids(sample_tokenized)
 
-                samples.append(Sample(input_ids = input_ids, 
+                samples.append(Sample(input_ids = input_ids,
                     tokenized = sample_tokenized,
                     mask_pos = sample_tokenized.index("[MASK]"),
                     correct_idx = correct_idx,
@@ -650,15 +650,14 @@ class EntityLinkingAsLM:
         if use_type_emb and not self.use_ebert_emb:
             self.wiki_title2qid, self.qid2label, self.qid2parent_qids = load_wikidata(wikidata_path)
 
-        #  train_data = self.read_aida_file(train_file, ignore_gold = False)
-        #  dev_data = self.read_aida_file(dev_file, ignore_gold = False)
-        #  test_data = self.read_aida_file(test_file, ignore_gold = True)
+        train_data = self.read_aida_file(train_file, ignore_gold = False)
+        dev_data = self.read_aida_file(dev_file, ignore_gold = False)
+        test_data = self.read_aida_file(test_file, ignore_gold = True)
 
         #  self.printing_samples(train_data, "train.samples")
         #  self.printing_samples(dev_data, "dev.samples")
-        test_data = self.read_aida_file(test_file, ignore_gold = False)
-        self.printing_samples(test_data, "test.samples")
-        exit(0)
+        #  test_data = self.read_aida_file(test_file, ignore_gold = False)
+        #  self.printing_samples(test_data, "test.samples")
 
         train_samples = self.data2samples(train_data)
 
