@@ -220,6 +220,78 @@ class EntityLinkingAsLM:
 
         return prec_micro, rec_micro, f1_micro
 
+    def printing_samples(self, data, out_path, verbose = True):
+
+        def get_types(wiki_title):
+            ent_types = []
+            if (wiki_title in self.wiki_title2qid and
+                self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
+                qid = self.wiki_title2qid[wiki_title]
+                parent_qids = self.qid2parent_qids[qid]
+                for qid in parent_qids:
+                    if qid in self.qid2label:
+                        label = self.qid2label[qid]
+                        ent_types.append(label)
+            return ent_types
+
+        fh = open(out_path, "w")
+        samples = []
+        for data_idx, (sentence, spans) in tqdm(data.items(), disable = not verbose, desc = "Converting data to samples"):
+            mentions = self.candidate_generator.get_mentions_raw_text(" ".join(sentence), whitespace_tokenize=True)
+            span2candidates = {}
+
+            span2gold = {(start, end): normalize_entity(self.ebert_emb, entity, self.ent_prefix) for entity, start, end in spans}
+            prev_start, prev_end = None, None
+            for (start, end), entities, priors in zip(mentions["candidate_spans"], mentions["candidate_entities"], mentions["candidate_entity_priors"]):
+                if any([x.startswith(self.ent_prefix) or x == "[PAD]" for x in sentence[start:end+1]]):
+                    continue
+
+                normalized = [normalize_entity(self.ebert_emb, entity, self.ent_prefix) for entity in entities]
+
+                valid_entities = []
+                valid_entities_set = set()
+                valid_priors = []
+
+                for entity, prior in zip(normalized, priors):
+                    if entity is None or entity in valid_entities_set:
+                        continue
+
+                    valid_entities.append(entity)
+                    valid_priors.append(prior)
+                    valid_entities_set.add(entity)
+
+                biases = [-1.0] + [float(f"{x:.3f}") for x in valid_priors]
+                entities = [None] + valid_entities
+
+                if prev_end is not None:
+                    tokens = sentence[prev_end+1:start]
+                    for token in tokens:
+                        fh.write(token + "\n")
+                if len(entities) > 1:
+                    span2candidates[(start, end)] = (entities, biases)
+                    tag = "No_Gold"
+                    gold_entity = None
+                    if (start, end) in span2gold:
+                        gold_entity = span2gold[(start, end)]
+                        gold_types = get_types(gold_entity)
+                        tag = f"{gold_entity}-{gold_types}"
+                    entities_types = [get_types(entity) for entity in entities]
+                    cand_tag = []
+                    sorted_zip = sorted(zip(entities_types, entities, biases),
+                                    key=lambda x:x[2], reverse=True)
+                    for entity_types, entity, biase in sorted_zip:
+                        if gold_entity == entity:
+                            cand_tag.append(f"{biase}--{entity}(True)-{entity_types}")
+                        else:
+                            cand_tag.append(f"{biase}--{entity}-{entity_types}")
+                    cand_tag = "  ".join(cand_tag)
+                    tag = f"{tag} | {cand_tag}"
+                    fh.write(f"{sentence[start:end+1]} : {tag}\n")
+                else:
+                    fh.write(f"{sentence[start:end+1]}\n")
+                prev_start, prev_end = start, end
+            fh.write("\n\n")
+        fh.close()
 
     def data2samples(self, data, verbose = True):
         samples = []
@@ -575,9 +647,19 @@ class EntityLinkingAsLM:
             for module in self.model.cls.predictions.transform.modules():
                 self.model._init_weights(module)
         
-        train_data = self.read_aida_file(train_file, ignore_gold = False)
-        dev_data = self.read_aida_file(dev_file, ignore_gold = False)
-        test_data = self.read_aida_file(test_file, ignore_gold = True)
+        if use_type_emb and not self.use_ebert_emb:
+            self.wiki_title2qid, self.qid2label, self.qid2parent_qids = load_wikidata(wikidata_path)
+
+        #  train_data = self.read_aida_file(train_file, ignore_gold = False)
+        #  dev_data = self.read_aida_file(dev_file, ignore_gold = False)
+        #  test_data = self.read_aida_file(test_file, ignore_gold = True)
+
+        #  self.printing_samples(train_data, "train.samples")
+        #  self.printing_samples(dev_data, "dev.samples")
+        test_data = self.read_aida_file(test_file, ignore_gold = False)
+        self.printing_samples(test_data, "test.samples")
+        exit(0)
+
         train_samples = self.data2samples(train_data)
 
         # Count ratio of null label
@@ -608,7 +690,6 @@ class EntityLinkingAsLM:
         if use_type_emb and not self.use_ebert_emb:
             print(f"using type emb, {self.type_emb_option}")
             idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
-            self.wiki_title2qid, self.qid2label, self.qid2parent_qids = load_wikidata(wikidata_path)
             found_ent = 0
             for idx in range(1, len(idx2ent)):
                 wiki_title = idx2ent[idx] # 'Rare_(company)'

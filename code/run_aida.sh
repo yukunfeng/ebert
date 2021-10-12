@@ -13,24 +13,31 @@ set -x
     # --test_file "../data/AIDA_sample/aida_test.txt"
 
 # rm "model_dir_tmp" -rf
-modes=(surface mix)
+modes=(mix)
+# note="param_mix_type_surface_dynamic_noprior"
+note="tmp"
 for mode in "${modes[@]}"
 do
-
-    python -u ./run_aida_iterative_modify.py --model_dir "model_type_emb_lr_$mode" \
+    python -u ./run_aida_iterative_modify_dynamic_surface.py \
+        --model_dir "./model_dirs/model_type_emb_lr_${mode}${note}" \
         --lr 2e-5 \
+        --nodo_use_priors \
+        --nouse_ebert_emb \
+        --warmup_proportion 0.1 \
         --nodo_predict_aida \
         --use_type_emb \
         --type_emb_option $mode \
         --use_pos_emb \
-        --epochs 4 \
+        --epochs 10 \
         --null_penalty 1.0 \
         --nodo_prime_mask \
-        --decode_iter 1 > ./logs/type_ent_pos_emb_lr${lr}_$mode.log 
+        --decode_iter 1 \
         # --train_file "../data/AIDA_sample/aida_train.txt" \
         # --dev_file "../data/AIDA_sample/aida_dev.txt" \
         # --test_file "../data/AIDA_sample/aida_test.txt"
+
 done
+    #> ./logs/type_ent_pos_emb_lr${lr}_${mode}${note}.log 
 
 
 # python ./run_aida_iterative_modify.py --model_dir "model_dir_ebert_default_update_randoment" \
