@@ -1,5 +1,6 @@
 import sys
 import os
+import pickle
 
 import numpy as np
 np.random.seed(0)
@@ -13,6 +14,7 @@ from embeddings import MappedEmbedding, load_embedding
 from mappers import load_mapper
 
 from kb.wiki_linking_util import WikiCandidateMentionGenerator
+from utils.util_wikidata import load_wikidata
 from tqdm import tqdm, trange
 from torch.autograd import Variable
 import re
@@ -21,17 +23,19 @@ import json
 import copy
 
 def normalize_entity(ebert_emb, entity, prefix = ""):
+    entity_no_prefix = entity
     entity = prefix + entity
 
     if entity is None:
         return None
 
     if not entity in ebert_emb:
-        return None
+        return entity_no_prefix
+        #  return None
 
     true_title = ebert_emb.index(entity).title
     true_entity = "_".join(ebert_emb.index(entity).title.split())
-    
+
     assert prefix + true_entity in ebert_emb
     return true_entity
 
@@ -39,7 +43,7 @@ def normalize_entity(ebert_emb, entity, prefix = ""):
 def extract_spans(in_file, out_file, kb = None):
     """
     Extract gold spans from AIDA file into a more handy format.
-    
+
     in_file : File in standard AIDA format
     out_file : TSV with format start -- end -- entity (wiki) id -- surface form
 
@@ -61,8 +65,8 @@ def extract_spans(in_file, out_file, kb = None):
                 entity = line.strip().split()[-1]
 
                 if kb is not None:
-                    entity = normalize_entity(kb, entity, kb.prefix) 
-                
+                    entity = normalize_entity(kb, entity, kb.prefix)
+
                 spans.append([entity, [], counter, counter-1])
                 flag = True
             elif line.startswith("MMEND"):
@@ -182,7 +186,9 @@ class EntityLinkingAsLM:
             self.ebert_emb = MappedEmbedding(self.ebert_emb, load_mapper(f"{ebert_name}.{bert_name}.{mapper_name}.npy"))
 
         tmp_bert_model = BertModel.from_pretrained(bert_name)
-        self.bert_emb = tmp_bert_model.embeddings.word_embeddings
+        self.bert_pos_emb = tmp_bert_model.embeddings.to(device=self.device)
+        self.bert_emb = self.bert_pos_emb.word_embeddings
+        #  self.bert_emb = tmp_bert_model.embeddings.word_embeddings
         del tmp_bert_model
          
         self.model = EmbInputBertForMaskedEmbLM.from_pretrained(bert_name).to(device = self.device)
@@ -214,6 +220,78 @@ class EntityLinkingAsLM:
 
         return prec_micro, rec_micro, f1_micro
 
+    def printing_samples(self, data, out_path, verbose = True):
+
+        def get_types(wiki_title):
+            ent_types = []
+            if (wiki_title in self.wiki_title2qid and
+                self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
+                qid = self.wiki_title2qid[wiki_title]
+                parent_qids = self.qid2parent_qids[qid]
+                for qid in parent_qids:
+                    if qid in self.qid2label:
+                        label = self.qid2label[qid]
+                        ent_types.append(label)
+            return ent_types
+
+        fh = open(out_path, "w")
+        samples = []
+        for data_idx, (sentence, spans) in tqdm(data.items(), disable = not verbose, desc = "Converting data to samples"):
+            mentions = self.candidate_generator.get_mentions_raw_text(" ".join(sentence), whitespace_tokenize=True)
+            span2candidates = {}
+
+            span2gold = {(start, end): normalize_entity(self.ebert_emb, entity, self.ent_prefix) for entity, start, end in spans}
+            prev_start, prev_end = None, None
+            for (start, end), entities, priors in zip(mentions["candidate_spans"], mentions["candidate_entities"], mentions["candidate_entity_priors"]):
+                if any([x.startswith(self.ent_prefix) or x == "[PAD]" for x in sentence[start:end+1]]):
+                    continue
+
+                normalized = [normalize_entity(self.ebert_emb, entity, self.ent_prefix) for entity in entities]
+
+                valid_entities = []
+                valid_entities_set = set()
+                valid_priors = []
+
+                for entity, prior in zip(normalized, priors):
+                    if entity is None or entity in valid_entities_set:
+                        continue
+
+                    valid_entities.append(entity)
+                    valid_priors.append(prior)
+                    valid_entities_set.add(entity)
+
+                biases = [-1.0] + [float(f"{x:.3f}") for x in valid_priors]
+                entities = [None] + valid_entities
+
+                if prev_end is not None:
+                    tokens = sentence[prev_end+1:start]
+                    for token in tokens:
+                        fh.write(token + "\n")
+                if len(entities) > 1:
+                    span2candidates[(start, end)] = (entities, biases)
+                    tag = "No_Gold"
+                    gold_entity = None
+                    if (start, end) in span2gold:
+                        gold_entity = span2gold[(start, end)]
+                        gold_types = get_types(gold_entity)
+                        tag = f"{gold_entity}-{gold_types}"
+                    entities_types = [get_types(entity) for entity in entities]
+                    cand_tag = []
+                    sorted_zip = sorted(zip(entities_types, entities, biases),
+                                    key=lambda x:x[2], reverse=True)
+                    for entity_types, entity, biase in sorted_zip:
+                        if gold_entity == entity:
+                            cand_tag.append(f"{biase}--{entity}(True)-{entity_types}")
+                        else:
+                            cand_tag.append(f"{biase}--{entity}-{entity_types}")
+                    cand_tag = "  ".join(cand_tag)
+                    tag = f"{tag} | {cand_tag}"
+                    fh.write(f"{sentence[start:end+1]} : {tag}\n")
+                else:
+                    fh.write(f"{sentence[start:end+1]}\n")
+                prev_start, prev_end = start, end
+            fh.write("\n\n")
+        fh.close()
 
     def data2samples(self, data, verbose = True):
         samples = []
@@ -284,7 +362,7 @@ class EntityLinkingAsLM:
                 sample_tokenized = ["[CLS]"] + sample_tokenized + ["[SEP]"]
                 input_ids = self.tokenizer.convert_tokens_to_ids(sample_tokenized)
 
-                samples.append(Sample(input_ids = input_ids, 
+                samples.append(Sample(input_ids = input_ids,
                     tokenized = sample_tokenized,
                     mask_pos = sample_tokenized.index("[MASK]"),
                     correct_idx = correct_idx,
@@ -419,7 +497,7 @@ class EntityLinkingAsLM:
 
 
     def _predict_sentence(self, sentence, batch_size = 4):#, gold_spans = None):
-        self.ent2idx = {None: 0}
+        #  self.ent2idx = {None: 0}
         
         samples = self.data2samples({(0,): [sentence, []]}, verbose = False)
         predictions = self.pred_loop(samples, batch_size = batch_size, verbose = False)
@@ -491,21 +569,109 @@ class EntityLinkingAsLM:
         
         with open(out_file, "w") as whandle:
             whandle.write("".join(norm_predictions))
+
+
+    def extract_spans(self, in_file, out_file):
+        """
+        Extract gold spans from AIDA file into a more handy format.
         
-    def train(self, train_file, dev_file, model_dir, 
+        in_file : File in standard AIDA format
+        out_file : TSV with format start -- end -- entity (wiki) id -- surface form
+
+        (Note that start and end positions are calculated w.r.t. to the entire file.)
+        """
+        counter = 0
+        flag = False
+        spans = []
+        with open(in_file) as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith("DOCSTART") or line.startswith("DOCEND") or line == "*NL*" or len(line) == 0:
+                    continue
+                elif line.startswith("MMSTART"):
+                    assert not flag
+                    entity = line.strip().split()[-1]
+
+                    entity = normalize_entity(self.ebert_emb, entity, self.ent_prefix)
+
+                    spans.append([entity, [], counter, counter-1])
+                    flag = True
+                elif line.startswith("MMEND"):
+                    flag = False
+                elif flag:
+                    spans[-1][-1] += 1
+                    spans[-1][1].append(line)
+                    counter += 1
+                else:
+                    counter += 1
+
+        spans.sort(key = lambda x:(x[-2], x[-1]))
+
+        with open(out_file, "w") as whandle:
+            for entity, surface, start, end in spans:
+                surface = " ".join(surface)
+                whandle.write(f"{start}\t{end}\t{entity}\t{surface}\n")
+
+
+    def train(self, train_file, dev_file, model_dir, test_file,
+            wikidata_path, use_type_emb, use_pos_emb, type_emb_option, use_ebert_emb,
             batch_size = 128, eval_batch_size = 4, gradient_accumulation_steps = 16, verbose = True,
-            epochs = 15, warmup_proportion = 0.1, lr = 5e-5, do_reinit_lm = False, beta2 = 0.999):
-        
+            epochs = 15, warmup_proportion = 0.1, lr = 5e-5, do_reinit_lm = False, beta2 = 0.999,
+            null_penalty=1.0):
+
+        self.use_ebert_emb = use_ebert_emb
+        self.type_emb_option = type_emb_option
+        self.use_pos_emb = use_pos_emb
+        self.model_dir = model_dir
+        self.dev_file = dev_file
+        self.test_file = test_file
+
+        if use_type_emb and type_emb_option == 'mix':
+            self.gate_hidden = nn.Linear(self.null_vector.shape[0],
+                                         self.null_vector.shape[0])
+            self.gate_hidden.to(device=self.device)
+
+
+        # Create temp gold files for predicting later
+        self.dev_gold_file = os.path.join(model_dir,
+                             os.path.basename(self.dev_file) + ".gold.txt")
+        self.test_gold_file = os.path.join(model_dir,
+                              os.path.basename(self.test_file) + ".gold.txt")
+        self.extract_spans(dev_file, self.dev_gold_file)
+        self.extract_spans(test_file, self.test_gold_file)
+
+
         self.ent2idx = {None: 0}
         
         if do_reinit_lm:
             for module in self.model.cls.predictions.transform.modules():
                 self.model._init_weights(module)
         
+        if use_type_emb and not self.use_ebert_emb:
+            self.wiki_title2qid, self.qid2label, self.qid2parent_qids = load_wikidata(wikidata_path)
+
         train_data = self.read_aida_file(train_file, ignore_gold = False)
         dev_data = self.read_aida_file(dev_file, ignore_gold = False)
+        test_data = self.read_aida_file(test_file, ignore_gold = True)
+
+        #  self.printing_samples(train_data, "train.samples")
+        #  self.printing_samples(dev_data, "dev.samples")
+        #  test_data = self.read_aida_file(test_file, ignore_gold = False)
+        #  self.printing_samples(test_data, "test.samples")
+
         train_samples = self.data2samples(train_data)
+
+        # Count ratio of null label
+        null_count = 0
+        for sample in train_samples:
+            correct_idx = sample.correct_idx
+            if correct_idx == 0:
+                null_count += 1
+        null_ratio = null_count / len(train_samples)
+        print(f"null_count:{null_count}/{len(train_samples)}, ratio:{null_ratio:.2f}")
+
         dev_samples = self.data2samples(dev_data)
+        test_samples = self.data2samples(test_data)
 
         self.parameters = [self.null_vector]
         optimizer_grouped_parameters = [{'params': [self.null_vector], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
@@ -537,23 +703,107 @@ class EntityLinkingAsLM:
 
             train_loss = self.train_loop(train_samples,
                     batch_size = batch_size // gradient_accumulation_steps, 
-                    gradient_accumulation_steps = gradient_accumulation_steps)
+                    gradient_accumulation_steps = gradient_accumulation_steps,
+                    null_penalty=null_penalty)
             
             print(f"Finishied training epoch {_+1}, loss per sample: {train_loss}")
             prec, rec, f1 = self.eval_loop(dev_samples, batch_size = eval_batch_size)
             #  self.save(model_dir, epoch = _+1)
-
+            print(f"prec:{prec}, rec:{rec}, f1:{f1} in epoch {_+1}")
             if f1 > best_f1: 
                 best_f1 = f1
-                print("\nNew best micro F1 in epoch {}! P R F1: {:.4} {:.4} {:.4}".format(_+1, prec, rec, f1), flush = True)
-                print("(This is an estimate. Use predict functions and the scorer for the real result.)", flush = True)
-                self.save(model_dir, epoch = None)
-    
+                print(f"This is a new best micro f1 in epoch {_+1}")
+                #  print("\nNew best micro F1 in epoch {}! P R F1: {:.4} {:.4} {:.4}".format(_+1, prec, rec, f1), flush = True)
+                #  print("(This is an estimate. Use predict functions and the scorer for the real result.)", flush = True)
+                #  self.save(model_dir, epoch = None)
+            self.get_predict_score()
+
+
+    def get_predict_score(self):
+        from score_aida import load_file
+        from score_aida import score_micro_f1, score_macro_f1
+
+        out_file_test = f"{os.path.basename(self.test_file)}.pred.txt"
+        test_pred_file = os.path.join(self.model_dir, out_file_test)
+        self.predict_aida(in_file = args.test_file, out_file = test_pred_file,
+                batch_size = 4, iterations = 1)
+        true = load_file(self.test_gold_file)
+        pred = load_file(test_pred_file)
+        print("Test Micro P: {:.5} R: {:.5} F1: {:.5}".format(*score_micro_f1(true, pred)))
+        print("Test Macro P: {:.5} R: {:.5} F1: {:.5}".format(*score_macro_f1(true, pred)))
+
+        out_file_dev = f"{os.path.basename(self.dev_file)}.pred.txt"
+        dev_pred_file = os.path.join(self.model_dir, out_file_dev)
+        self.predict_aida(in_file = args.dev_file, out_file = dev_pred_file,
+                batch_size = 4, iterations = 1)
+
+        true = load_file(self.dev_gold_file)
+        pred = load_file(dev_pred_file)
+        print("Valid Micro P: {:.5} R: {:.5} F1: {:.5}".format(*score_micro_f1(true, pred)))
+        print("Valid Macro P: {:.5} R: {:.5} F1: {:.5}".format(*score_macro_f1(true, pred)))
+
+
+
+    def get_ent_surface_emb(self, wiki_title):
+      surface_emb = None
+      wiki_title = wiki_title.replace('_', ' ')
+      wiki_title = wiki_title.replace('(', '')
+      wiki_title = wiki_title.replace(')', '')
+      if wiki_title == '':
+          return None
+      wiki_title_tokenized = self.tokenizer.tokenize(wiki_title)
+      wiki_title_ids = self.tokenizer.convert_tokens_to_ids(wiki_title_tokenized)
+      wiki_title_ids = torch.tensor(wiki_title_ids)
+      wiki_title_ids = wiki_title_ids.to(device=self.device)
+      wiki_title_emb = self.bert_emb(wiki_title_ids) # shape: (n, 768)
+      surface_emb = torch.mean(wiki_title_emb, dim=0) # shape: (768,)
+      return surface_emb
+
+
+    def get_ent_emb_from_type_knowledge(self, wiki_title):
+      """"
+      wiki_title: str, e.g., Jimmy_Wales
+      return: tensor of shape (768,) if found else None
+      """
+      assert self.type_emb_option in ['type', 'surface', 'mix']
+      type_emb = None
+      if True:
+        if (wiki_title in self.wiki_title2qid and
+            self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
+            qid = self.wiki_title2qid[wiki_title]
+            parent_qids = self.qid2parent_qids[qid]
+            valid_parent_count = 0
+            sum_label_emb = torch.zeros(size=(self.bert_emb.weight.shape[1],),
+                                        dtype=self.bert_emb.weight.dtype)
+            sum_label_emb = sum_label_emb.to(device=self.device)
+            for qid in parent_qids:
+                if qid in self.qid2label:
+                    label = self.qid2label[qid]
+                    label_tokenized = self.tokenizer.tokenize(label)
+                    label_ids = self.tokenizer.convert_tokens_to_ids(label_tokenized)
+                    label_ids = torch.tensor(label_ids).to(device=self.device)
+                    label_emb = self.bert_emb(label_ids) # shape: (n, 768)
+                    label_emb = torch.mean(label_emb, dim=0) # shape: (768,)
+                    sum_label_emb = sum_label_emb + label_emb
+                    valid_parent_count += 1
+            if valid_parent_count > 0:
+                mean_label_emb = sum_label_emb / valid_parent_count
+                type_emb = mean_label_emb
+      if type_emb is None:
+          return self.get_ent_surface_emb(wiki_title)
+      else:
+          return type_emb
+
+
     def save(self, model_dir, epoch=None):
         f_model = os.path.join(model_dir, "model.pth") if epoch is None else os.path.join(model_dir, f"model_{epoch}.pth")
         f_null_vector = os.path.join(model_dir, "null_vector.pth") if epoch is None else os.path.join(model_dir, f"null_vector_{epoch}.pth")
         torch.save(self.model.state_dict(), f_model)
         torch.save(self.null_vector, f_null_vector)
+        f_ent_emb = os.path.join(model_dir, "ent_emb.pth")
+        f_ent2idx = os.path.join(model_dir, "ent2idx.pth")
+        with open(f_ent2idx, 'wb') as fh:
+            pickle.dump(self.ent2idx, fh)
         
         if self.do_use_priors:
             f_null_bias = os.path.join(model_dir, "null_bias.pth") if epoch is None else os.path.join(model_dir, f"null_bias_{epoch}.pth")
@@ -562,8 +812,12 @@ class EntityLinkingAsLM:
     def load(self, model_dir, epoch = None):
         f_model = os.path.join(model_dir, "model.pth") if epoch is None else os.path.join(model_dir, f"model_{epoch}.pth")
         f_null_vector = os.path.join(model_dir, "null_vector.pth") if epoch is None else os.path.join(model_dir, f"null_vector_{epoch}.pth")
+        f_ent_emb = os.path.join(model_dir, "ent_emb.pth")
+        f_ent2idx = os.path.join(model_dir, "ent2idx.pth")
         self.model.load_state_dict(torch.load(f_model))
         self.null_vector.data = torch.load(f_null_vector).data
+        with open(f_ent2idx, 'rb') as fh:
+            self.ent2idx = pickle.load(fh)
         
         if self.do_use_priors:
             f_null_bias = os.path.join(model_dir, "null_bias.pth") if epoch is None else os.path.join(model_dir, f"null_bias_{epoch}.pth")
@@ -576,7 +830,9 @@ class EntityLinkingAsLM:
             max_len = self.max_len
         
         input_ids = torch.zeros((len(samples), max_len)).to(dtype = torch.long)
+        input_ids = input_ids.to(device=self.device)
         attention_mask = torch.zeros_like(input_ids)
+        attention_mask = attention_mask.to(device=self.device)
 
         for i, sample in enumerate(samples):
             assert len(sample.tokenized) <= max_len
@@ -584,17 +840,28 @@ class EntityLinkingAsLM:
             input_ids[i,:len(sample.input_ids)] = torch.tensor(sample.input_ids).to(dtype = input_ids.dtype)
             attention_mask[i,:len(sample.input_ids)] = 1
 
-        input_embeddings = self.bert_emb(input_ids)
+        if self.use_pos_emb:
+            input_embeddings = self.bert_pos_emb(input_ids)
+        else:
+            input_embeddings = self.bert_emb(input_ids)
         #unk_id = self.tokenizer.vocab["[UNK]"]
 
+        idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
         for i, sample in enumerate(samples):
             for j, token in enumerate(sample.tokenized):
                 if j == sample.mask_pos:
                     assert token == "[MASK]"
                     if self.do_prime_mask:
                         assert sample.candidates[0] is None
-                        candidate_embeddings = np.array([self.ebert_emb[self.ent_prefix + ent] for ent in sample.candidates[1:]])
-                        input_embeddings[i,j,:] = torch.tensor(np.mean(candidate_embeddings, 0)).to(dtype = input_embeddings.dtype)
+                        biases = [np.exp(x) for x in sample.biases[1:]]
+                        weighted_ent = torch.zeros(size=(self.null_vector.shape[0],))
+                        weighted_ent = weighted_ent.to(device=self.null_vector.device)
+                        wiki_titles = [idx2ent[idx] for idx in sample.candidate_ids[1:]]
+                        candidate_embeddings = [self.get_ent_emb_from_type_knowledge(wiki_title) for wiki_title in wiki_titles]
+                        for biase, cand_emb in zip(biases, candidate_embeddings):
+                            weighted_ent = weighted_ent + biase * cand_emb
+                        input_embeddings[i,j,:] = weighted_ent.to(device=input_embeddings.device)
+                        #  input_embeddings[i,j,:] = torch.tensor(np.mean(candidate_embeddings, 0)).to(dtype = input_embeddings.dtype)
 
                 elif token.startswith(self.ent_prefix):
                     input_embeddings[i,j,:] = torch.tensor(self.ebert_emb[token]).to(dtype = input_embeddings.dtype)
@@ -605,10 +872,11 @@ class EntityLinkingAsLM:
 
         return {"input_ids": input_embeddings, "attention_mask": attention_mask, "label_ids": label_ids}
 
-    def train_loop(self, samples, batch_size, gradient_accumulation_steps, verbose = True):
+    def train_loop(self, samples, batch_size, gradient_accumulation_steps,
+                   verbose = True, null_penalty=1.0):
         return self.loop(samples = samples, batch_size = batch_size, 
                 gradient_accumulation_steps = gradient_accumulation_steps, 
-                mode = "train", verbose = verbose)
+                mode = "train", verbose = verbose, null_penalty=null_penalty)
 
     def eval_loop(self, samples, batch_size, verbose = True):
         return self.loop(samples = samples, batch_size = batch_size, 
@@ -618,7 +886,8 @@ class EntityLinkingAsLM:
         return self.loop(samples = samples, batch_size = batch_size, 
                 gradient_accumulation_steps = 1, mode = "pred", verbose = verbose)
 
-    def loop(self, samples, batch_size, mode, gradient_accumulation_steps, verbose = 1):
+    def loop(self, samples, batch_size, mode, gradient_accumulation_steps,
+             verbose = 1, null_penalty=1.0):
         assert mode in ("train", "eval", "pred")
 
         all_true, all_pred, all_losses, all_pred_spans = [], [], [], []
@@ -632,10 +901,6 @@ class EntityLinkingAsLM:
         assert len(idx2ent) == len(self.ent2idx)
         assert sorted(list(idx2ent.keys())) == list(range(len(idx2ent)))
     
-        entity_embedding = torch.zeros((len(idx2ent), self.null_vector.shape[0]))
-        entity_embedding[1:] = torch.tensor(self.ebert_emb[[self.ent_prefix + idx2ent[idx] for idx in range(1, len(idx2ent))]])
-        entity_embedding = entity_embedding.to(dtype = self.null_vector.dtype)
-
         for step, i in enumerate(trange(0, len(samples), batch_size, desc = f"Iterations ({mode})", disable = not verbose)):
             batch = samples[i:i+batch_size]
 
@@ -653,7 +918,15 @@ class EntityLinkingAsLM:
             all_outputs = self.model(**input_dict)[0]
             outputs = torch.stack([all_outputs[j, position] for j, position in enumerate(mask_positions)])
 
-            batch_entity_embedding = entity_embedding[torch.tensor(all_entities)].to(device = self.device) # move entity embeddings for entire batch to GPU
+
+            wiki_titles = [idx2ent[idx] for idx in all_entities]
+            wiki_title_type_embs = [self.get_ent_emb_from_type_knowledge(wiki_title) for wiki_title in wiki_titles]
+            batch_entity_embedding = torch.stack(wiki_title_type_embs).to(device=self.device)
+
+            wiki_title_surface_embs = [self.get_ent_surface_emb(wiki_title) for wiki_title in wiki_titles]
+            batch_surface_embedding = torch.stack(wiki_title_surface_embs).to(device=self.device)
+            gate_out = torch.sigmoid(self.gate_hidden(batch_entity_embedding))
+            batch_entity_embedding = (1 - gate_out) * batch_entity_embedding  + gate_out * batch_surface_embedding
 
             batch_loss = 0
             for j, sample in enumerate(batch):
@@ -683,12 +956,14 @@ class EntityLinkingAsLM:
 
                 elif mode == "train":
                     sample_loss = -torch.log(probas[label_ids[j]])
-                    
+                    if label_ids[j] == 0:
+                      sample_loss = sample_loss * null_penalty
                     batch_loss += sample_loss / len(batch)
                     all_losses.append(float(sample_loss.item()))
 
             if mode == "train":
-                print(f"step {step+1}: mean loss over batch: {batch_loss.item()}")
+                if (step+1) % 1000 == 0:
+                    print(f"step {step+1}: mean loss over batch: {batch_loss.item()}")
                 batch_loss.backward()
                 
                 if (step+1) % gradient_accumulation_steps == 0:
@@ -708,13 +983,26 @@ class EntityLinkingAsLM:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type = str, required = True)
-    parser.add_argument("--bert_name", type = str, default = "bert-base-cased")
+    parser.add_argument("--bert_name", type = str, default = "bert-base-uncased")
     parser.add_argument("--mapper_name", type = str, default = "linear")
     parser.add_argument("--ebert_name", type = str, default = "wikipedia2vec-base-cased")
     
     parser.add_argument("--train_file", type = str, default = "../data/AIDA/aida_train.txt")
     parser.add_argument("--dev_file", type = str, default = "../data/AIDA/aida_dev.txt")
     parser.add_argument("--test_file", type = str, default = "../data/AIDA/aida_test.txt")
+
+    parser.add_argument("--wikidata_path", type = str, default = "/home/lr/yukun/kg-bert/entities.slimed.tsv")
+
+    parser.add_argument("--use_type_emb", dest = "use_type_emb", action = "store_true", default = True)
+    parser.add_argument("--type_emb_option", type = str, default = "type",
+                        help="type, surface or mix")
+    parser.add_argument("--nouse_type_emb", dest = "use_type_emb", action = "store_false")
+
+    parser.add_argument("--use_ebert_emb", dest = "use_ebert_emb", action = "store_true", default = False)
+    parser.add_argument("--nouse_ebert_emb", dest = "use_ebert_emb", action = "store_false")
+
+    parser.add_argument("--use_pos_emb", dest = "use_pos_emb", action = "store_true", default = True)
+    parser.add_argument("--nouse_pos_emb", dest = "use_pos_emb", action = "store_false")
 
     parser.add_argument("--do_reinit_lm", action = "store_true")
     parser.add_argument("--do_predict_all_epochs", action = "store_true")
@@ -735,6 +1023,7 @@ def parse_args():
     parser.add_argument("--max_candidates", type = int, default = 1000)
     parser.add_argument("--epochs", type = int, default = 10)
     parser.add_argument("--warmup_proportion", type = float, default = 0.1)
+    parser.add_argument("--null_penalty", type = float, default = 1.0)
     parser.add_argument("--device", type = int, default = 0)
     parser.add_argument("--lr", type = float, default = 2e-5)
     parser.add_argument("--batch_size", type = int, default = 128)
@@ -756,8 +1045,15 @@ def train(args):
             "do_use_priors": args.do_use_priors}
 
     train_args = {"train_file": args.train_file, "dev_file": args.dev_file,
+            "test_file": args.test_file,
             "model_dir": args.model_dir, "lr": args.lr, "epochs": args.epochs,
             "do_reinit_lm": args.do_reinit_lm,
+            "null_penalty": args.null_penalty,
+            "type_emb_option": args.type_emb_option,
+            "wikidata_path": args.wikidata_path,
+            "use_pos_emb": args.use_pos_emb,
+            "use_type_emb": args.use_type_emb,
+            "use_ebert_emb": args.use_ebert_emb,
             "batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "warmup_proportion": args.warmup_proportion, "eval_batch_size": args.eval_batch_size}
 
