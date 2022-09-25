@@ -25,7 +25,8 @@ set -x
 lrs=(3e-5)
 for lr in "${lrs[@]}"
 do
-    note="all_dynamic_space_saved_search_lr_${lr}epoch4_no_prime"
+    # note="all_dynamic_space_saved_search_lr_${lr}epoch4_no_prime"
+    note="reproduce"
     python -u ./run_aida_iterative_modify_dynamic_all_emask_uncased_space_saved.py \
         --model_dir "./model_dirs/model_${note}" \
         --mapper_name "None" \
