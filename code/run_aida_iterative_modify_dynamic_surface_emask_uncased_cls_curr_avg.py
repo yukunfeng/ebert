@@ -673,8 +673,40 @@ class EntityLinkingAsLM:
         dev_samples = self.data2samples(dev_data)
         test_samples = self.data2samples(test_data)
 
-        self.parameters = [self.null_vector]
-        optimizer_grouped_parameters = [{'params': [self.null_vector], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
+        # Init entity embeddings
+        entity_embedding = torch.FloatTensor(
+            len(self.ent2idx), self.null_vector.shape[0]).uniform_(
+                  -self.model.config.initializer_range,
+                  self.model.config.initializer_range)
+        if self.use_ebert_emb:
+            print("using ebert_emb")
+            idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
+            entity_embedding.data[1:] = torch.tensor(self.ebert_emb[[self.ent_prefix + idx2ent[idx] for idx in range(1, len(idx2ent))]])
+        entity_embedding = entity_embedding.to(dtype=self.null_vector.dtype)
+        entity_embedding = entity_embedding.to(device=self.device)
+        self.entity_embedding = entity_embedding
+
+        if use_type_emb and not self.use_ebert_emb:
+            print(f"using type emb, {self.type_emb_option}")
+            idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
+            found_ent = 0
+            for idx in range(1, len(idx2ent)):
+                wiki_title = idx2ent[idx] # 'Rare_(company)'
+                emb = self.get_ent_emb_from_type_knowledge(wiki_title)
+                if emb is not None:
+                    self.entity_embedding.data[idx] = emb.detach()
+                    found_ent += 1
+            found_ratio = found_ent / (len(idx2ent) - 1)
+            print(f"found_ent: {found_ent}/{len(idx2ent) - 1} = {found_ratio:.2f}")
+        self.entity_embedding.requires_grad = True
+        assert self.entity_embedding.requires_grad == True
+        assert self.entity_embedding.is_leaf == True
+
+
+        self.parameters = [self.null_vector, self.entity_embedding]
+        optimizer_grouped_parameters = [{'params': [self.null_vector, self.entity_embedding], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
+        #  self.parameters = [self.null_vector]
+        #  optimizer_grouped_parameters = [{'params': [self.null_vector], 'weight_decay': 0.01}, {'params': [], 'weight_decay': 0.0}]
         
         if self.do_use_priors:
             self.parameters.append(self.null_bias)
@@ -767,7 +799,7 @@ class EntityLinkingAsLM:
       """
       assert self.type_emb_option in ['type', 'surface', 'mix']
       type_emb = None
-      if True:
+      if self.type_emb_option in ['type', 'mix']:
         if (wiki_title in self.wiki_title2qid and
             self.wiki_title2qid[wiki_title] in self.qid2parent_qids):
             qid = self.wiki_title2qid[wiki_title]
@@ -789,6 +821,7 @@ class EntityLinkingAsLM:
             if valid_parent_count > 0:
                 mean_label_emb = sum_label_emb / valid_parent_count
                 type_emb = mean_label_emb
+      return type_emb
       if type_emb is None:
           return self.get_ent_surface_emb(wiki_title)
       else:
@@ -802,6 +835,7 @@ class EntityLinkingAsLM:
         torch.save(self.null_vector, f_null_vector)
         f_ent_emb = os.path.join(model_dir, "ent_emb.pth")
         f_ent2idx = os.path.join(model_dir, "ent2idx.pth")
+        torch.save(self.entity_embedding, f_ent_emb)
         with open(f_ent2idx, 'wb') as fh:
             pickle.dump(self.ent2idx, fh)
         
@@ -816,6 +850,7 @@ class EntityLinkingAsLM:
         f_ent2idx = os.path.join(model_dir, "ent2idx.pth")
         self.model.load_state_dict(torch.load(f_model))
         self.null_vector.data = torch.load(f_null_vector).data
+        self.entity_embedding = torch.load(f_ent_emb)
         with open(f_ent2idx, 'rb') as fh:
             self.ent2idx = pickle.load(fh)
         
@@ -846,7 +881,6 @@ class EntityLinkingAsLM:
             input_embeddings = self.bert_emb(input_ids)
         #unk_id = self.tokenizer.vocab["[UNK]"]
 
-        idx2ent = {self.ent2idx[ent]: ent for ent in self.ent2idx}
         for i, sample in enumerate(samples):
             for j, token in enumerate(sample.tokenized):
                 if j == sample.mask_pos:
@@ -855,9 +889,8 @@ class EntityLinkingAsLM:
                         assert sample.candidates[0] is None
                         biases = [np.exp(x) for x in sample.biases[1:]]
                         weighted_ent = torch.zeros(size=(self.null_vector.shape[0],))
-                        weighted_ent = weighted_ent.to(device=self.null_vector.device)
-                        wiki_titles = [idx2ent[idx] for idx in sample.candidate_ids[1:]]
-                        candidate_embeddings = [self.get_ent_emb_from_type_knowledge(wiki_title) for wiki_title in wiki_titles]
+                        weighted_ent = weighted_ent.to(device=self.entity_embedding.device)
+                        candidate_embeddings = [self.entity_embedding[idx].detach() for idx in sample.candidate_ids[1:]]
                         for biase, cand_emb in zip(biases, candidate_embeddings):
                             weighted_ent = weighted_ent + biase * cand_emb
                         input_embeddings[i,j,:] = weighted_ent.to(device=input_embeddings.device)
@@ -901,6 +934,10 @@ class EntityLinkingAsLM:
         assert len(idx2ent) == len(self.ent2idx)
         assert sorted(list(idx2ent.keys())) == list(range(len(idx2ent)))
     
+        #  entity_embedding = torch.zeros((len(idx2ent), self.null_vector.shape[0]))
+        #  entity_embedding[1:] = torch.tensor(self.ebert_emb[[self.ent_prefix + idx2ent[idx] for idx in range(1, len(idx2ent))]])
+        #  entity_embedding = entity_embedding.to(dtype = self.null_vector.dtype)
+
         for step, i in enumerate(trange(0, len(samples), batch_size, desc = f"Iterations ({mode})", disable = not verbose)):
             batch = samples[i:i+batch_size]
 
@@ -917,12 +954,11 @@ class EntityLinkingAsLM:
             
             all_outputs = self.model(**input_dict)[0]
             outputs = torch.stack([all_outputs[j, position] for j, position in enumerate(mask_positions)])
+            outputs_cls = torch.stack([all_outputs[j, 0] for j, _ in enumerate(mask_positions)])
 
+            batch_entity_embedding = self.entity_embedding[torch.tensor(all_entities).to(device=self.device)].to(device = self.device) # move entity embeddings for entire batch to GPU
 
             wiki_titles = [idx2ent[idx] for idx in all_entities]
-            wiki_title_type_embs = [self.get_ent_emb_from_type_knowledge(wiki_title) for wiki_title in wiki_titles]
-            batch_entity_embedding = torch.stack(wiki_title_type_embs).to(device=self.device)
-
             wiki_title_surface_embs = [self.get_ent_surface_emb(wiki_title) for wiki_title in wiki_titles]
             batch_surface_embedding = torch.stack(wiki_title_surface_embs).to(device=self.device)
             gate_out = torch.sigmoid(self.gate_hidden(batch_entity_embedding))
@@ -932,7 +968,8 @@ class EntityLinkingAsLM:
             for j, sample in enumerate(batch):
                 assert len(sample.candidate_ids) == ranges[j][1] - ranges[j][0] + 1
                 candidates_with_zero = torch.cat([self.null_vector.unsqueeze(0), batch_entity_embedding[ranges[j][0]:ranges[j][1]]])
-                logits = candidates_with_zero.matmul(outputs[j])
+                context = 0.5 * (outputs[j] + outputs_cls[j])
+                logits = candidates_with_zero.matmul(context)
                 
                 if self.do_use_priors:
                     assert sample.biases[0] is None
@@ -1111,7 +1148,6 @@ def predict_aida(args):
                     batch_size = args.eval_batch_size, iterations = args.decode_iter)
 
 if __name__ == "__main__":
-    import ipdb; ipdb.set_trace()
     args = parse_args()
     print(os.uname(), flush = True)
     print("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", None), flush = True)
